@@ -1,0 +1,190 @@
+// backend/index.js
+
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const mysql = require('mysql2/promise');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+
+const app = express();
+const port = 3001;
+
+// --- Middleware ---
+app.use(cors());
+app.use(express.json());
+
+// --- MySQL Connection Pool Setup ---
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  database: process.env.DB_DATABASE,
+  password: process.env.DB_PASSWORD,
+  port: process.env.DB_PORT,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
+
+// --- Google Gemini Setup ---
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
+
+// --- Dynamic Schema Generation (No changes here) ---
+let dbSchema = '';
+
+async function generateDbSchema() {
+  try {
+    const connection = await pool.getConnection();
+    const [tables] = await connection.query('SHOW TABLES');
+    
+    let schema = 'You have access to a college database with the following tables:\n\n';
+
+    for (const table of tables) {
+      const tableName = Object.values(table)[0];
+      schema += `Table: ${tableName}\n`;
+      
+      const [columns] = await connection.query(`DESCRIBE ${tableName}`);
+      schema += ' - Columns: ';
+      schema += columns.map(c => `${c.Field} (${c.Type})`).join(', ');
+      schema += '\n';
+
+      const [foreignKeys] = await connection.query(`
+        SELECT kcu.column_name, kcu.referenced_table_name, kcu.referenced_column_name 
+        FROM information_schema.key_column_usage AS kcu
+        WHERE kcu.table_schema = DATABASE() AND kcu.table_name = ? AND kcu.referenced_table_name IS NOT NULL;
+      `, [tableName]);
+
+      if (foreignKeys.length > 0) {
+        schema += ' - Foreign Keys:\n';
+        for (const fk of foreignKeys) {
+          schema += `   - ${tableName}.${fk.column_name} references ${fk.referenced_table_name}.${fk.referenced_column_name}\n`;
+        }
+      }
+      schema += '\n';
+    }
+    
+    connection.release();
+    console.log("Database schema successfully generated.");
+    return schema;
+  } catch (error) {
+    console.error("Error generating database schema:", error);
+    process.exit(1); 
+  }
+}
+
+// --- The Core API Logic ---
+// THIS IS THE ONLY SECTION THAT HAS BEEN MODIFIED
+app.post('/api/query', async (req, res) => {
+  const { userInput } = req.body;
+  if (!userInput) {
+    return res.status(400).json({ error: 'User input is required.' });
+  }
+
+  if (!dbSchema) {
+    return res.status(503).json({ error: 'Database schema is not yet available. Please try again in a moment.' });
+  }
+
+  try {
+    // ========================================================================
+    // STEP 1: Convert user input to a structured JSON object (Metadata Layer)
+    // ========================================================================
+    const intentExtractionPrompt = `
+      You are a natural language processing expert. Your task is to analyze a user's question about a college database and convert it into a structured JSON object.
+      Do not generate SQL. Only generate a valid JSON object.
+
+      Database Schema:
+      ${dbSchema}
+
+      Analyze the user's question and extract the following information:
+      - "intent": What is the main goal? (e.g., "COUNT", "SELECT", "AVG", "SUM").
+      - "target_columns": An array of columns the user wants to see. Use ["*"] for all columns.
+      - "target_table": The primary table the query is about.
+      - "joins_required": An array of other tables that need to be joined.
+      - "filters": An array of filter conditions, each being an object with "column", "operator", and "value".
+      - "group_by": An array of columns to group the results by, if any.
+      - "order_by": An object with "column" and "direction" ("ASC" or "DESC"), if any.
+      - "limit": A number, if the user asks for a specific number of results (e.g., "top 5").
+
+      User Question: "${userInput}"
+
+      JSON Output:
+    `;
+
+    let result = await model.generateContent(intentExtractionPrompt);
+    let response = await result.response;
+    let jsonResponseText = response.text().trim().replace(/```json|```/g, ''); // Clean up potential markdown
+    
+    let structuredQuery;
+    try {
+        structuredQuery = JSON.parse(jsonResponseText);
+    } catch (e) {
+        console.error("Failed to parse JSON from LLM:", jsonResponseText);
+        return res.status(500).json({ error: "Failed to understand the user's question." });
+    }
+
+    // ========================================================================
+    // STEP 2: Generate SQL from the structured JSON object (Secure Step)
+    // The original 'userInput' is NOT used in this step.
+    // ========================================================================
+    const sqlGenerationPrompt = `
+      You are an expert MySQL query writer. Your task is to generate a single, valid MySQL SELECT query based on a database schema and a structured JSON request.
+      Do not generate any text or explanation, only the SQL query.
+
+      Database Schema:
+      ${dbSchema}
+
+      Structured JSON Request:
+      \`\`\`json
+      ${JSON.stringify(structuredQuery, null, 2)}
+      \`\`\`
+
+      Rules:
+      - Use clear aliases for tables (e.g., s for students, d for departments).
+      - Ensure correct JOIN syntax based on the foreign keys in the schema.
+
+      SQL Query:
+    `;
+
+    result = await model.generateContent(sqlGenerationPrompt);
+    response = await result.response;
+    let generatedSql = response.text().trim();
+    
+    // --- Enhanced Security Validation (No changes here) ---
+    if (generatedSql === 'Invalid query.' || !generatedSql.toLowerCase().startsWith('select')) {
+        console.error("Validation failed: Generated content is not a valid SELECT statement.", generatedSql);
+        return res.status(400).json({ error: "The provided question could not be converted into a valid database query." });
+    }
+    if (generatedSql.includes(';')) {
+        console.error("Validation failed: Multiple SQL statements detected.", generatedSql);
+        return res.status(400).json({ error: "Multiple SQL statements are not allowed." });
+    }
+
+    console.log("Generated SQL (from JSON):", generatedSql);
+
+    // Execute the query
+    const [rows] = await pool.query(generatedSql);
+    
+    res.json({
+      query: generatedSql,
+      results: rows,
+    });
+
+  } catch (error) {
+    console.error("Error processing request:", error);
+    if (error.sqlMessage) {
+      return res.status(400).json({ error: `The generated SQL query had an error: ${error.sqlMessage}` });
+    }
+    res.status(500).json({ error: 'Failed to process your request.' });
+  }
+});
+
+
+// --- Server Startup (No changes here) ---
+async function startServer() {
+  dbSchema = await generateDbSchema();
+  app.listen(port, () => {
+    console.log(`Backend server listening at http://localhost:${port}`);
+  });
+}
+
+startServer();
