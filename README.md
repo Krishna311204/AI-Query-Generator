@@ -9,8 +9,8 @@ A key feature of this application is its secure, two-step architecture. Raw user
 - Natural Language Interface: Query the database using plain English instead of SQL.
 - Secure by Design: Uses an intermediate metadata-only representation to isolate the LLM from raw user input.
 - Dynamic Schema Awareness: The backend automatically fetches the database schema at startup.
-- Data Visualization Ready: API responses are structured for easy integration with charting libraries.
-- RESTful API: Simple endpoints for integration with any frontend framework.
+- Data Visualization Ready: Its responses are structured for easy integration with charting libraries.
+
 
 ## Architecture
 The application follows a secure, multi-step process:
